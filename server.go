@@ -10,6 +10,7 @@ import (
 
 	"github.com/buoyantio/slow_cooker/load"
 	restful "github.com/emicklei/go-restful"
+	"github.com/golang/glog"
 )
 
 const (
@@ -19,18 +20,18 @@ const (
 )
 
 type BenchmarkState struct {
-	Id      string
-	Error   string
-	State   string
-	Results []*load.BenchmarkRecord
+	Id      string                  `json:"id"`
+	Error   string                  `json:"error"`
+	State   string                  `json:"state"`
+	Results []*load.BenchmarkRecord `json:"results"`
 }
 
 type CalibrationState struct {
-	Id       string
-	Results  []*load.CalibrationRecord
-	FinalQps int
-	Error    string
-	State    string
+	Id          string                    `json:"id"`
+	Results     []*load.CalibrationRecord `json:"results"`
+	FinalResult *load.CalibrationRecord   `json:"finalResult"`
+	Error       string                    `json:"error"`
+	State       string                    `json:"state"`
 }
 
 type Server struct {
@@ -59,28 +60,31 @@ func (server *Server) Run() {
 func newRestfulService(server *Server) {
 	service := new(restful.WebService)
 	service.Path("/slowcooker").Consumes(restful.MIME_JSON).Produces(restful.MIME_JSON)
-	service.Route(service.POST("/benchmark").To(server.RunBenchmark))
+	service.Route(service.POST("/benchmark/{RunId}").To(server.RunBenchmark))
 	service.Route(service.GET("/benchmark/{RunId}").To(server.GetBenchmarkRunningState))
-	service.Route(service.POST("/calibrate").To(server.RunCalibration))
+	service.Route(service.POST("/calibrate/{RunId}").To(server.RunCalibration))
 	service.Route(service.GET("/calibrate/{RunId}").To(server.GetCalibrateRunningState))
 	restful.Add(service)
 }
 
+func max(a int, b int) int {
+	if a > b {
+		return a
+	}
+
+	return b
+}
+
 // RunTest : Run test
 func (server *Server) RunBenchmark(request *restful.Request, response *restful.Response) {
-	singleLoad := load.AppLoad{}
-	err := request.ReadEntity(&singleLoad)
+	loadRequest := load.BenchmarkRequest{}
+	err := request.ReadEntity(&loadRequest)
 	if err != nil {
-		response.WriteError(http.StatusBadRequest, err)
+		response.WriteError(http.StatusBadRequest, errors.New("Unable to read benchmark request: "+err.Error()))
 		return
 	}
 
-	if singleLoad.TotalRequests == 0 {
-		response.WriteError(http.StatusBadRequest, errors.New("TotalRequests cannot not be 0"))
-		return
-	}
-
-	id := singleLoad.RunId
+	id := request.PathParameter("RunId")
 	if id == "" {
 		response.WriteError(http.StatusBadRequest, fmt.Errorf("Benchmark ID not provided"))
 		return
@@ -89,34 +93,35 @@ func (server *Server) RunBenchmark(request *restful.Request, response *restful.R
 	server.mutex.Lock()
 	defer server.mutex.Unlock()
 
-	if _, ok := server.Benchmarks[id]; !ok {
-		response.WriteError(http.StatusBadRequest, fmt.Errorf("Task exist"))
+	if _, ok := server.Benchmarks[id]; ok {
+		response.WriteError(http.StatusBadRequest, fmt.Errorf("Task %s already exist", id))
 		return
 	}
 
 	state := &BenchmarkState{Id: id, State: RUNNING_STATE}
 	server.Benchmarks[id] = state
 
-	loadDuration, err := time.ParseDuration(singleLoad.LoadTime)
+	loadDuration, err := time.ParseDuration(loadRequest.LoadTime)
 	if err != nil {
-		response.WriteError(http.StatusBadRequest, fmt.Errorf("Unable to parse load time: "+err.Error()))
+		response.WriteError(http.StatusBadRequest, fmt.Errorf("Unable to parse load time: %s", err.Error()))
 		return
 	}
 
 	go func() {
-		for i := 0; i < 3; i++ {
+		for i := 0; i < max(1, loadRequest.RunsPerIntensity); i++ {
 			go func() {
-				singleLoad.Run()
+				loadRequest.AppLoad.Run()
 			}()
 
 			<-time.After(loadDuration)
-			singleLoad.Stop()
+			loadRequest.AppLoad.Stop()
 			newRecord := &load.BenchmarkRecord{
-				PercentileMin: singleLoad.HandlerParams.GlobalHist.Min(),
-				Percentile50:  singleLoad.HandlerParams.GlobalHist.ValueAtQuantile(50),
-				Percentile95:  singleLoad.HandlerParams.GlobalHist.ValueAtQuantile(95),
-				Percentile99:  singleLoad.HandlerParams.GlobalHist.ValueAtQuantile(99),
-				PercentileMax: singleLoad.HandlerParams.GlobalHist.Max(),
+				Failures:      loadRequest.AppLoad.HandlerParams.Failed + loadRequest.AppLoad.HandlerParams.Bad,
+				PercentileMin: loadRequest.AppLoad.HandlerParams.GlobalHist.Min(),
+				Percentile50:  loadRequest.AppLoad.HandlerParams.GlobalHist.ValueAtQuantile(50),
+				Percentile95:  loadRequest.AppLoad.HandlerParams.GlobalHist.ValueAtQuantile(95),
+				Percentile99:  loadRequest.AppLoad.HandlerParams.GlobalHist.ValueAtQuantile(99),
+				PercentileMax: loadRequest.AppLoad.HandlerParams.GlobalHist.Max(),
 			}
 
 			state.Results = append(state.Results, newRecord)
@@ -149,31 +154,35 @@ func (server *Server) RunCalibration(request *restful.Request, response *restful
 		return
 	}
 
-	id := calibration.Load.RunId
+	id := request.PathParameter("RunId")
 	if id == "" {
 		response.WriteError(http.StatusBadRequest, fmt.Errorf("Calibrate ID not provided"))
 		return
 	}
 
+	glog.V(1).Infof("Received run calibration request: %+v", calibration)
+
 	server.mutex.Lock()
 	defer server.mutex.Unlock()
 
 	if _, exist := server.Calibrations[id]; exist {
-		response.WriteError(http.StatusBadRequest, fmt.Errorf("Task exist"))
+		response.WriteError(http.StatusBadRequest, fmt.Errorf("Calibration %s is already running", id))
 		return
 	}
 
 	state := &CalibrationState{Id: id, State: RUNNING_STATE}
-	server.Calibrations[calibration.Load.RunId] = state
+	server.Calibrations[id] = state
+
+	run := load.NewLatencyCalibrationRun(id, &calibration)
 
 	go func() {
-		finalQps, err := calibration.Run()
+		err := run.Run()
 		if err != nil {
 			state.Error = err.Error()
 			state.State = FAILED_STATE
 		} else {
-			state.Results = calibration.Results
-			state.FinalQps = finalQps
+			state.Results = run.Results
+			state.FinalResult = run.FinalResult
 			state.State = FINISHED_STATE
 		}
 	}()

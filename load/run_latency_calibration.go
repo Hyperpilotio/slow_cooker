@@ -2,6 +2,7 @@ package load
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/golang/glog"
@@ -15,79 +16,116 @@ type SLO struct {
 }
 
 type CalibrationRecord struct {
-	Qps       int
-	LatencyMs int64
+	Concurrency int    `json:"concurrency"`
+	LatencyMs   int64  `json:"latencyMs"`
+	Failures    uint64 `json:"failures"`
+}
+
+type LatencyCalibrationRun struct {
+	RunId       string
+	Config      *LatencyCalibration
+	Results     []*CalibrationRecord
+	FinalResult *CalibrationRecord
+}
+
+func NewLatencyCalibrationRun(id string, calibrate *LatencyCalibration) *LatencyCalibrationRun {
+	return &LatencyCalibrationRun{
+		RunId:   id,
+		Config:  calibrate,
+		Results: make([]*CalibrationRecord, 0),
+	}
 }
 
 // RunCalibrationParams : latency struct
 type LatencyCalibration struct {
-	SLO              SLO     `json:"slo"`
-	InitialQps       int     `json:"initialQps"`
-	Step             int     `json:"step"`
-	RunsPerIntensity int     `json:"runsPerIntensity"`
-	Load             AppLoad `json:"appLoad"`
-
-	// internal state
-	Results []*CalibrationRecord
+	SLO       SLO     `json:"slo"`
+	Load      AppLoad `json:"appLoad"`
+	Calibrate struct {
+		InitialConcurrency int `json:"initialConcurrency"`
+		Step               int `json:"step"`
+		RunsPerIntensity   int `json:"runsPerIntensity"`
+	} `json:"calibrate"`
+	LoadTime string `json:"loadTime"`
 }
 
-func (load *LatencyCalibration) getSummaryLatency() int64 {
+func (load *LatencyCalibrationRun) getSummaryLatency() int64 {
 	var sum int64
 	length := len(load.Results)
-	for i := 0; i < load.RunsPerIntensity; i++ {
+	for i := 0; i < load.Config.Calibrate.RunsPerIntensity; i++ {
 		sum += load.Results[length-1-i].LatencyMs
 	}
 
-	return sum / int64(load.RunsPerIntensity)
+	return sum / int64(load.Config.Calibrate.RunsPerIntensity)
 }
 
-func (load *LatencyCalibration) Run() (int, error) {
-	loadDuration, err := time.ParseDuration(load.Load.LoadTime)
+func (load *LatencyCalibrationRun) Run() error {
+	glog.Infof("Start running latency calibration for id: " + load.RunId)
+	appLoad := &load.Config.Load
+	// Override defaults for calibration
+	appLoad.NoLatencySummary = true
+	// Setting a long default interval as we don't need periodic metrics
+	appLoad.Interval = time.Hour * 24
+	loadDuration, err := time.ParseDuration(load.Config.LoadTime)
 	if err != nil {
-		return 0, errors.New("Unable to parse load time: " + err.Error())
+		glog.Errorf("Unable to parse load time '%s': ", load.Config.LoadTime, err.Error())
+		return fmt.Errorf("Unable to parse load time '%s': %s", load.Config.LoadTime, err.Error())
 	}
 
 	load.Results = make([]*CalibrationRecord, 0)
-	qps := load.InitialQps
-	finalQps := 0
+	concurrency := load.Config.Calibrate.InitialConcurrency
 	runs := 1
-	for {
-		load.Load.Qps = qps
-		for i := 0; i < load.RunsPerIntensity; i++ {
-			glog.Infof("Starting calibration run #%d with qps %d", i+1, qps)
+	for runs < MAX_RUNS {
+		appLoad.Concurrency = concurrency
+		var failedCount uint64
+		for i := 0; i < load.Config.Calibrate.RunsPerIntensity || failedCount > 0; i++ {
+			failedCount = 0
 			go func() {
-				load.Load.Run()
+				glog.Infof("Starting calibration run #%d with concurrency %d", i+1, concurrency)
+				appLoad.Run()
 			}()
 			<-time.After(loadDuration)
-			load.Load.Stop()
-			latency := load.Load.HandlerParams.GlobalHist.ValueAtQuantile(float64(load.SLO.Percentile))
-			glog.Infof("Run #%d with qps %d has latency %d", i+1, qps, latency)
+			appLoad.Stop()
+
+			if appLoad.HandlerParams.Failed+appLoad.HandlerParams.Bad > 0 {
+				failedCount = appLoad.HandlerParams.Failed + appLoad.HandlerParams.Bad
+			}
+
+			latency := appLoad.HandlerParams.GlobalHist.ValueAtQuantile(float64(load.Config.SLO.Percentile))
+			glog.Infof("Run #%d with concurrency %d finished with percentile %d, latency %d. failures %d",
+				i+1, concurrency, load.Config.SLO.Percentile, latency, failedCount)
 			load.Results = append(load.Results, &CalibrationRecord{
-				LatencyMs: latency,
-				Qps:       qps,
+				LatencyMs:   latency,
+				Concurrency: concurrency,
+				Failures:    failedCount,
 			})
+		}
+
+		if failedCount > 0 {
+			glog.Warningf("Found %d failures in last run, ending calibration loop", failedCount)
+			break
 		}
 
 		latency := load.getSummaryLatency()
 
-		if latency > load.SLO.LatencyMs {
-			if len(load.Results) <= load.RunsPerIntensity {
-				return 0, errors.New("Initial qps was unable to meet latency requirement")
-			}
-
-			finalQps = load.Results[len(load.Results)-load.RunsPerIntensity-1].Qps
-			glog.Infof("Found final Qps %d", finalQps)
+		if latency > load.Config.SLO.LatencyMs {
+			glog.Warningf("Last run's latency (%d) exceeds SLO (%d), ending calibration loop", latency, load.Config.SLO.LatencyMs)
 			break
 		}
 
-		runs += 1
-
-		if runs > MAX_RUNS {
-			return 0, errors.New("Max runs reached without finding final qps")
+		load.FinalResult = &CalibrationRecord{
+			Concurrency: concurrency,
+			LatencyMs:   latency,
+			Failures:    0,
 		}
-
-		qps += load.Step
+		runs += 1
+		concurrency += load.Config.Calibrate.Step
 	}
 
-	return finalQps, nil
+	if load.FinalResult == nil {
+		glog.Errorf("Initial Qps wasn't able to meet latency requirement for run id " + load.RunId)
+		return errors.New("Initial qps was unable to meet latency requirement")
+	}
+
+	glog.Infof("Found final concurrency %d", load.FinalResult)
+	return nil
 }
