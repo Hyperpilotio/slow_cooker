@@ -3,7 +3,7 @@ package load
 import (
 	"bytes"
 	"crypto/tls"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"hash"
 	"hash/fnv"
@@ -29,6 +29,7 @@ import (
 	"github.com/buoyantio/slow_cooker/ring"
 	"github.com/buoyantio/slow_cooker/window"
 	"github.com/codahale/hdrhistogram"
+	"github.com/jmcvetta/randutil"
 )
 
 type HeaderSet map[string]string
@@ -80,34 +81,27 @@ type HandlerParams struct {
 // AppLoad
 type AppLoad struct {
 	CommandMode         bool
-	Qps                 int           `json:"qps"`
-	Concurrency         int           `json:"concurrency"`
-	Method              string        `json:"method"`
-	Interval            time.Duration `json:"interval"`
-	Noreuse             bool          `json:"noreuse"`
-	Compress            bool          `json:"compress"`
-	NoLatencySummary    bool          `json:"noLatencySummary"`
-	ReportLatenciesCSV  string        `json:"reportLatenciesCSV"`
-	TotalRequests       uint64        `json:"totalRequests"`
-	HashValue           uint64        `json:"hashValue"`
-	HashSampleRate      float64       `json:"hashSampleRate"`
-	DstURL              string        `json:"url"`
-	Hosts               []string      `json:"hosts"`
-	Data                string        `json:"data"`
-	LoadTime            string        `json:'loadTime' binding:"required"`
-	Scenario            []Task        `json:"scenario"`
-	Headers             HeaderSet     `json:"headers"`
+	Qps                 int                 `json:"qps"`
+	Concurrency         int                 `json:"concurrency"`
+	Method              string              `json:"method"`
+	Interval            time.Duration       `json:"interval"`
+	Noreuse             bool                `json:"noreuse"`
+	Compress            bool                `json:"compress"`
+	NoLatencySummary    bool                `json:"noLatencySummary"`
+	ReportLatenciesCSV  string              `json:"reportLatenciesCSV"`
+	TotalRequests       uint64              `json:"totalRequests"`
+	HashValue           uint64              `json:"hashValue"`
+	HashSampleRate      float64             `json:"hashSampleRate"`
+	DstURL              string              `json:"url"`
+	Hosts               []string            `json:"hosts"`
+	Data                string              `json:"data"`
+	LoadTime            string              `json:'loadTime' binding:"required"`
+	Scenarios           []scenario.Scenario `json:"scenarios"`
+	Headers             HeaderSet           `json:"headers"`
 	HistogramWindowSize time.Duration
 	reqID               uint64
 	HandlerParams       *HandlerParams
 	MetricOpts          *metrics.MetricsOpts
-}
-
-type Task struct {
-	UrlTemplate string `json:"url_template"`
-	Method      string `json:"method"`
-	Data        string `json:"data"`
-	DrainResp   string `json:"drain_resp"`
 }
 
 func (load *AppLoad) onExit() {
@@ -131,21 +125,31 @@ func (load *AppLoad) Run() error {
 		load.Hosts = []string{""}
 	}
 
-	var tasks []Task
+	scenarios := make([]randutil.Choice, 0)
 
-	if len(load.Scenario) == 0 {
-		tasks = make([]Task, 1)
-		tasks = append(tasks, Task{UrlTemplate: load.DstURL, Method: load.Method, Data: load.Data})
+	if len(load.Scenarios) == 0 {
+		scenarios = append(scenarios, randutil.Choice{
+			Weight: 1,
+			Item: &Scenario{Tasks: []Task{
+				Task{UrlTemplate: load.DstURL, Method: load.Method, Data: load.Data}},
+			},
+		})
 	} else {
-		tasks = load.Scenario
+		for _, scenario := range load.Scenarios {
+			weight := scenario.Weight
+			if weight == 0 {
+				// Zero weight will never be picked
+				weight = 1
+			}
+			scenarios = append(scenarios, randutil.Choice{
+				Weight: weight,
+				Item:   &scenario,
+			})
+		}
 	}
 
-	dstUrl, err := url.Parse(tasks[0].UrlTemplate)
-	if err != nil {
-		return errors.New("Unable to parse url: " + err.Error())
-	}
-
-	doTLS := dstUrl.Scheme == "https"
+	// TODO: Detect TLS
+	doTLS := false
 	client := newClient(load.Compress, doTLS, load.Noreuse, load.Concurrency)
 	// The time portion of the header can change due to timezone.
 	timeLen := len(time.Now().Format(time.RFC3339))
@@ -161,7 +165,7 @@ func (load *AppLoad) Run() error {
 	}
 
 	// Run Request
-	load.runRequest(&tasks, client)
+	load.runRequest(scenarios, client)
 
 	// Collect Metrics
 	load.collectMetrics()
@@ -319,7 +323,7 @@ func sendRequest(
 }
 
 // RunRequest : Parallel sending request with RunLoadParams.Concurrency threads
-func (load *AppLoad) runRequest(tasks *[]Task, client *http.Client) {
+func (load *AppLoad) runRequest(scenarios []randutil.Choice, client *http.Client) {
 	for i := 0; i < load.Concurrency; i++ {
 		ticker := time.NewTicker(load.HandlerParams.timeToWait)
 		go func() {
@@ -339,7 +343,13 @@ func (load *AppLoad) runRequest(tasks *[]Task, client *http.Client) {
 					load.HandlerParams.shouldFinishLock.RUnlock() // compile path parameter
 
 					drainResp := make(map[string]string)
-					for _, task := range *tasks {
+					choice, err := randutil.WeightedChoice(scenarios)
+					if err != nil {
+						log.Panicf("Unexpected error when choosing task: " + err.Error())
+					}
+
+					scenario := choice.Item.(*Scenario)
+					for _, task := range scenario.Tasks {
 						var dstUrl *url.URL
 						var err error
 						parsedUrl := task.UrlTemplate
@@ -352,12 +362,13 @@ func (load *AppLoad) runRequest(tasks *[]Task, client *http.Client) {
 						if err != nil {
 							log.Panicf("URL parsing error")
 						}
+
 						resp := sendRequest(client, task.Method, dstUrl, load.Hosts[rand.Intn(len(load.Hosts))], load.Headers, LoadData(task.Data), atomic.AddUint64(&load.reqID, 1), load.HashValue, checkHash, hasher, load.HandlerParams.received, bodyBuffer)
-						if task.DrainResp != "" {
+						if task.ResponseObject != "" {
 							if len(resp) > 0 {
 								data := map[string]interface{}{}
 								json.Unmarshal(resp, &data)
-								drainResp[task.DrainResp] = data[task.DrainResp].(string)
+								drainResp[task.ResponseObject] = data[task.ResponseObject].(string)
 							}
 						}
 					}
