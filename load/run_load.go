@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"hash"
 	"hash/fnv"
@@ -76,11 +75,25 @@ type HandlerParams struct {
 	shouldFinish       bool
 	shouldFinishLock   sync.RWMutex
 	sendTraffic        sync.WaitGroup
+	startStep          chan *RunningStep
+	stopStep           bool
+	stopStepSignal     chan bool
+}
+
+type RunningStep struct {
+	Qps         int    `json:"qps"`
+	Concurrency int    `json:concurrency`
+	Duration    string `json:"string"`
+}
+
+type RunningPlan struct {
+	RunningSteps []*RunningStep `json:"runningSteps"`
 }
 
 // AppLoad
 type AppLoad struct {
 	CommandMode         bool
+	Plan                RunningPlan   `json:"plan"`
 	Qps                 int           `json:"qps"`
 	Concurrency         int           `json:"concurrency"`
 	Method              string        `json:"method"`
@@ -95,7 +108,7 @@ type AppLoad struct {
 	DstURL              string        `json:"url"`
 	Hosts               []string      `json:"hosts"`
 	Data                string        `json:"data"`
-	LoadTime            string        `json:'loadTime' binding:"required"`
+	LoadTime            string        `json:"loadTime" binding:"required"`
 	Scenario            []Task        `json:"scenario"`
 	Headers             HeaderSet     `json:"headers"`
 	HistogramWindowSize time.Duration
@@ -141,13 +154,6 @@ func (load *AppLoad) Run() error {
 		tasks = load.Scenario
 	}
 
-	dstUrl, err := url.Parse(tasks[0].UrlTemplate)
-	if err != nil {
-		return errors.New("Unable to parse url: " + err.Error())
-	}
-
-	doTLS := dstUrl.Scheme == "https"
-	client := newClient(load.Compress, doTLS, load.Noreuse, load.Concurrency)
 	// The time portion of the header can change due to timezone.
 	timeLen := len(time.Now().Format(time.RFC3339))
 	timePadding := strings.Repeat(" ", timeLen)
@@ -160,19 +166,77 @@ func (load *AppLoad) Run() error {
 	if load.CommandMode {
 		signal.Notify(load.HandlerParams.interrupted, syscall.SIGINT)
 	}
+	var steps []*RunningStep
 
-	// Run Request
-	load.runRequest(&tasks, client)
+	// get QPS, Concurrency, LoadTime from Plan
+	if len(load.Plan.RunningSteps) > 0 {
+		steps = load.Plan.RunningSteps
+	} else {
+		steps = append(steps, &RunningStep{
+			Qps:         load.Qps,
+			Concurrency: load.Concurrency,
+			Duration:    load.LoadTime,
+		})
+	}
 
-	// Collect Metrics
+	// push jobs to runner
+	go func() {
+		for _, step := range steps {
+			load.HandlerParams.startStep <- step
+			loadTime, err := time.ParseDuration(step.Duration)
+			if err != nil {
+				log.Panicf("Unable to parse duration, %v", step.Duration)
+				load.HandlerParams.stopStep = true
+			}
+			<-time.After(loadTime)
+			load.HandlerParams.stopStep = true
+		}
+	}()
+
+	load.StartLoadRunner()
+
+	// Collect Metrics (handler)
 	load.collectMetrics()
 
 	return nil
 }
 
+func (load *AppLoad) StartLoadRunner() {
+	go func() {
+		var tasks []Task
+
+		if len(load.Scenario) == 0 {
+			tasks = make([]Task, 1)
+			tasks[0] = Task{UrlTemplate: load.DstURL, Method: load.Method, Data: load.Data}
+		} else {
+			tasks = load.Scenario
+		}
+
+		dstURL, err := url.Parse(tasks[0].UrlTemplate)
+		if err != nil {
+			log.Panicf("Unable to parse url: %v", err.Error())
+		}
+		doTLS := dstURL.Scheme == "https"
+
+		for {
+			select {
+			case step := <-load.HandlerParams.startStep:
+				load.HandlerParams.stopStep = false
+				fmt.Printf("start step with Qps: %v Concurrency: %v duration: %v\n", step.Qps, step.Concurrency, step.Duration)
+				load.Qps = step.Qps
+				load.Concurrency = step.Concurrency
+				load.HandlerParams.timeToWait = CalcTimeToWait(&load.Qps)
+				client := newClient(load.Compress, doTLS, load.Noreuse, load.Concurrency)
+				// Run Request
+				load.runRequest(&tasks, client)
+			}
+
+		}
+	}()
+}
+
 // NewHandlerParams : initialize HandlerParams
 func NewHandlerParams(params *AppLoad) *HandlerParams {
-	requestData := LoadData(params.Data)
 
 	return &HandlerParams{
 		Good:               uint64(0),
@@ -182,7 +246,6 @@ func NewHandlerParams(params *AppLoad) *HandlerParams {
 		Max:                int64(0),
 		FailedHashCheck:    int64(0),
 		GlobalHist:         hdrhistogram.New(0, DayInMs, 3),
-		requestData:        requestData,
 		count:              uint64(0),
 		size:               uint64(0),
 		hist:               hdrhistogram.New(0, DayInMs, 3),
@@ -193,6 +256,9 @@ func NewHandlerParams(params *AppLoad) *HandlerParams {
 		totalTrafficTarget: params.Qps * params.Concurrency * int(params.Interval.Seconds()),
 		cleanup:            make(chan bool, 2),
 		exit:               make(chan bool, 2),
+		startStep:          make(chan *RunningStep),
+		stopStep:           true,
+		stopStepSignal:     make(chan bool, 2),
 		interrupted:        make(chan os.Signal, 2),
 	}
 }
@@ -280,7 +346,6 @@ func sendRequest(
 	}
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 	response, err := client.Do(req)
-
 	if err != nil {
 		received <- &MeasuredResponse{err: err}
 	} else {
@@ -312,6 +377,7 @@ func sendRequest(
 					code:            response.StatusCode,
 					latency:         elapsed.Nanoseconds() / 1000000,
 					failedHashCheck: failedHashCheck}
+
 				return bytes
 			}
 		}
@@ -342,7 +408,6 @@ func (load *AppLoad) runRequest(tasks *[]Task, client *http.Client) {
 				})
 			}
 			for _ = range ticker.C {
-
 				for _, data := range dataIndex {
 					if data.Index > len(data.Data)-1 {
 						// start over from begining
@@ -357,8 +422,9 @@ func (load *AppLoad) runRequest(tasks *[]Task, client *http.Client) {
 				} else {
 					checkHash = false
 				}
+
 				load.HandlerParams.shouldFinishLock.RLock()
-				if !load.HandlerParams.shouldFinish {
+				if !(load.HandlerParams.shouldFinish && load.HandlerParams.stopStep) {
 					load.HandlerParams.shouldFinishLock.RUnlock() // compile path parameter
 
 					drainResp := make(map[string]string)
