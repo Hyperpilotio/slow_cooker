@@ -81,9 +81,9 @@ type HandlerParams struct {
 }
 
 type RunningStep struct {
-	Qps         int    `json:"qps"`
-	Concurrency int    `json:concurrency`
-	Duration    string `json:"string"`
+	Qps         int    `json:"qps" binding:"required"`
+	Concurrency int    `json:"concurrency" binding:"required"`
+	Duration    string `json:"duration" binding:"required"`
 }
 
 type RunningPlan struct {
