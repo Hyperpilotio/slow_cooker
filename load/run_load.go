@@ -181,15 +181,17 @@ func (load *AppLoad) Run() error {
 
 	// push jobs to runner
 	go func() {
-		for _, step := range steps {
-			load.HandlerParams.startStep <- step
-			loadTime, err := time.ParseDuration(step.Duration)
-			if err != nil {
-				log.Panicf("Unable to parse duration, %v", step.Duration)
+		for {
+			for _, step := range steps {
+				load.HandlerParams.startStep <- step
+				loadTime, err := time.ParseDuration(step.Duration)
+				if err != nil {
+					log.Panicf("Unable to parse duration, %v", step.Duration)
+					load.HandlerParams.stopStep = true
+				}
+				<-time.After(loadTime)
 				load.HandlerParams.stopStep = true
 			}
-			<-time.After(loadTime)
-			load.HandlerParams.stopStep = true
 		}
 	}()
 
@@ -429,7 +431,6 @@ func (load *AppLoad) runRequest(tasks *[]Task, client *http.Client) {
 
 					drainResp := make(map[string]string)
 					for i, task := range *tasks {
-
 						var dstUrl *url.URL
 						var err error
 						parsedUrl := task.UrlTemplate
